@@ -1,0 +1,47 @@
+{
+  "name": "edge-session-crypto",
+  "version": "0.1.0",
+  "description": "Stateless encrypted cookie session manager for Edge, Cloudflare Workers, and Node.js with AES-GCM and key rotation. Zero runtime dependencies.",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "README_JA.md",
+    "SECURITY.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "pretest": "npm run build",
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "session",
+    "cookie",
+    "edge",
+    "cloudflare-workers",
+    "webcrypto",
+    "aes-gcm",
+    "security",
+    "stateless",
+    "zero-dependencies"
+  ],
+  "author": "takao-dev",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
