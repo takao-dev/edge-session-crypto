@@ -20,6 +20,8 @@ export interface SessionConfig {
   cookie?: CookieSerializeOptions;
   /** Crypto PBKDF2 iterations. Defaults to 100,000. */
   iterations?: number;
+  /** Enable automatic payload compression. Defaults to false. */
+  compress?: boolean;
 }
 
 export class SessionManager<T = Record<string, any>> {
@@ -28,6 +30,7 @@ export class SessionManager<T = Record<string, any>> {
   readonly ttl: number;
   readonly cookieOptions: CookieSerializeOptions;
   readonly iterations: number;
+  readonly compress: boolean;
 
   constructor(config: SessionConfig) {
     if (!config || !config.password) {
@@ -42,6 +45,7 @@ export class SessionManager<T = Record<string, any>> {
 
     this.ttl = config.ttl ?? 86400; // 24 hours
     this.iterations = config.iterations ?? 100_000;
+    this.compress = Boolean(config.compress);
     this.cookieOptions = {
       path: '/',
       httpOnly: true,
@@ -54,10 +58,11 @@ export class SessionManager<T = Record<string, any>> {
 
   /**
    * Retrieve and decrypt the session from an HTTP Cookie header string, Request object, or Headers instance.
-   * Returns null if the session cookie is missing, expired, or invalid.
+   * Supports optional client AAD binding (e.g. user-agent).
    */
   async getSession(
-    input: string | Request | Headers | { headers?: Headers | Record<string, string> } | null | undefined
+    input: string | Request | Headers | { headers?: Headers | Record<string, string> } | null | undefined,
+    additionalData?: string
   ): Promise<T | null> {
     const cookieHeader = this.extractCookieHeader(input);
     if (!cookieHeader) return null;
@@ -69,6 +74,7 @@ export class SessionManager<T = Record<string, any>> {
     try {
       return await unsealData<T>(sealed, this.passwords, {
         iterations: this.iterations,
+        additionalData,
       });
     } catch {
       return null;
@@ -78,11 +84,13 @@ export class SessionManager<T = Record<string, any>> {
   /**
    * Encrypt session data and return a `Set-Cookie` header string ready to send to the client.
    */
-  async setSession(data: T, customTtl?: number): Promise<string> {
+  async setSession(data: T, customTtl?: number, additionalData?: string): Promise<string> {
     const ttl = typeof customTtl === 'number' ? customTtl : this.ttl;
     const sealed = await sealData<T>(data, this.passwords, {
       ttl,
       iterations: this.iterations,
+      additionalData,
+      compress: this.compress,
     });
 
     const cookieOpts: CookieSerializeOptions = {
@@ -91,6 +99,13 @@ export class SessionManager<T = Record<string, any>> {
     };
 
     return serializeCookie(this.cookieName, sealed, cookieOpts);
+  }
+
+  /**
+   * Re-encrypt an existing session with the newest primary key (active key migration).
+   */
+  async rotateSession(existingData: T, additionalData?: string): Promise<string> {
+    return this.setSession(existingData, this.ttl, additionalData);
   }
 
   /**

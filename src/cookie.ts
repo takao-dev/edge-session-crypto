@@ -1,12 +1,13 @@
 /**
  * High-performance, RFC 6265bis & CHIPS (Partitioned Cookies) compliant cookie helpers.
+ * Includes Prefix Guard enforcement for __Host- and __Secure- cookies.
  * Zero Runtime Dependencies.
  */
 
 export interface CookieSerializeOptions {
   /** Cookie path. Defaults to '/'. */
   path?: string;
-  /** Cookie domain. */
+  /** Cookie domain. Must be undefined for __Host- cookies. */
   domain?: string;
   /** Max age in seconds. */
   maxAge?: number;
@@ -20,6 +21,27 @@ export interface CookieSerializeOptions {
   sameSite?: 'lax' | 'strict' | 'none' | boolean;
   /** Enables CHIPS (Cookies Having Independent Partitioned State). Defaults to false. */
   partitioned?: boolean;
+}
+
+/**
+ * Validate security invariants for special cookie prefixes per RFC 6265bis.
+ */
+export function validateCookiePrefix(name: string, options: CookieSerializeOptions): void {
+  if (name.startsWith('__Host-')) {
+    if (options.secure === false) {
+      throw new Error('__Host- cookies must have Secure=true');
+    }
+    if (options.path && options.path !== '/') {
+      throw new Error('__Host- cookies must have Path="/"');
+    }
+    if (options.domain) {
+      throw new Error('__Host- cookies must not specify a Domain attribute');
+    }
+  } else if (name.startsWith('__Secure-')) {
+    if (options.secure === false) {
+      throw new Error('__Secure- cookies must have Secure=true');
+    }
+  }
 }
 
 /**
@@ -72,6 +94,9 @@ export function serializeCookie(
   if (!name || typeof name !== 'string') {
     throw new Error('Cookie name must be a non-empty string');
   }
+
+  // Enforce Prefix Guard
+  validateCookiePrefix(name, options);
 
   const encodedValue = encodeURIComponent(value);
   let str = `${name}=${encodedValue}`;

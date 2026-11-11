@@ -1,6 +1,7 @@
 /**
  * Cryptographic helpers for edge-session-crypto.
  * Native WebCrypto SubtleCrypto implementation with Zero Runtime Dependencies.
+ * Features: AES-256-GCM, PBKDF2-SHA256, AAD client binding, Deflate compression.
  */
 
 const encoder = new TextEncoder();
@@ -64,11 +65,41 @@ export async function deriveKey(secret: string, salt: Uint8Array, iterations = 1
   );
 }
 
+/**
+ * Compress bytes using native CompressionStream (deflate).
+ */
+export async function compressBytes(data: Uint8Array): Promise<Uint8Array> {
+  if (typeof CompressionStream === 'undefined') return data;
+  const cs = new CompressionStream('deflate');
+  const writer = cs.writable.getWriter();
+  await writer.write(data as unknown as BufferSource);
+  await writer.close();
+  const buffer = await new Response(cs.readable).arrayBuffer();
+  return new Uint8Array(buffer);
+}
+
+/**
+ * Decompress bytes using native DecompressionStream (deflate).
+ */
+export async function decompressBytes(data: Uint8Array): Promise<Uint8Array> {
+  if (typeof DecompressionStream === 'undefined') return data;
+  const ds = new DecompressionStream('deflate');
+  const writer = ds.writable.getWriter();
+  await writer.write(data as unknown as BufferSource);
+  await writer.close();
+  const buffer = await new Response(ds.readable).arrayBuffer();
+  return new Uint8Array(buffer);
+}
+
 export interface SealOptions {
   /** Time to live in seconds. If unset, session does not expire automatically. */
   ttl?: number;
   /** PBKDF2 derivation iterations. Defaults to 100,000. */
   iterations?: number;
+  /** Additional Authenticated Data (AAD) to cryptographically bind to the session (e.g. User-Agent or IP). */
+  additionalData?: string;
+  /** Enable transparent payload compression. Defaults to false. */
+  compress?: boolean;
 }
 
 export interface UnsealOptions {
@@ -76,12 +107,15 @@ export interface UnsealOptions {
   clockTolerance?: number;
   /** PBKDF2 derivation iterations. Defaults to 100,000. */
   iterations?: number;
+  /** Additional Authenticated Data (AAD) that must match the value provided during sealData. */
+  additionalData?: string;
 }
 
 interface Envelope<T> {
   data: T;
   iat: number;
   exp?: number;
+  c?: boolean; // compressed flag
 }
 
 /**
@@ -107,22 +141,34 @@ export async function sealData<T = any>(
   if (typeof options.ttl === 'number' && options.ttl > 0) {
     envelope.exp = now + options.ttl * 1000;
   }
+  if (options.compress) {
+    envelope.c = true;
+  }
 
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const iterations = options.iterations ?? 100_000;
 
   const key = await deriveKey(activeSecret, salt, iterations);
-  const plaintext = encoder.encode(JSON.stringify(envelope));
+  let plaintextBytes: Uint8Array = encoder.encode(JSON.stringify(envelope));
+  if (options.compress) {
+    plaintextBytes = await compressBytes(plaintextBytes);
+  }
+
+  const gcmParams: AesGcmParams = {
+    name: 'AES-GCM',
+    iv: iv as unknown as BufferSource,
+    tagLength: 128,
+  };
+
+  if (options.additionalData) {
+    gcmParams.additionalData = encoder.encode(options.additionalData) as unknown as BufferSource;
+  }
 
   const ciphertext = await crypto.subtle.encrypt(
-    {
-      name: 'AES-GCM',
-      iv: iv as unknown as BufferSource,
-      tagLength: 128,
-    },
+    gcmParams,
     key,
-    plaintext as unknown as BufferSource
+    plaintextBytes as unknown as BufferSource
   );
 
   return [
@@ -177,6 +223,16 @@ export async function unsealData<T = any>(
   const iterations = options.iterations ?? 100_000;
   const toleranceMs = (options.clockTolerance ?? 60) * 1000;
 
+  const gcmParams: AesGcmParams = {
+    name: 'AES-GCM',
+    iv: iv as unknown as BufferSource,
+    tagLength: 128,
+  };
+
+  if (options.additionalData) {
+    gcmParams.additionalData = encoder.encode(options.additionalData) as unknown as BufferSource;
+  }
+
   let decryptedBuffer: ArrayBuffer | null = null;
 
   for (const secret of secrets) {
@@ -184,17 +240,13 @@ export async function unsealData<T = any>(
     try {
       const key = await deriveKey(secret, salt, iterations);
       decryptedBuffer = await crypto.subtle.decrypt(
-        {
-          name: 'AES-GCM',
-          iv: iv as unknown as BufferSource,
-          tagLength: 128,
-        },
+        gcmParams,
         key,
         ciphertext as unknown as BufferSource
       );
       break;
     } catch {
-      // Key mismatch or tampered ciphertext; continue to next rotation candidate
+      // Key mismatch or tampered ciphertext / AAD mismatch; continue to next secret
     }
   }
 
@@ -202,12 +254,39 @@ export async function unsealData<T = any>(
     throw new Error('Failed to unseal session: authentication failed or tampered data');
   }
 
-  const envelope: Envelope<T> = JSON.parse(decoder.decode(decryptedBuffer));
-  const now = Date.now();
+  let decryptedBytes: Uint8Array = new Uint8Array(decryptedBuffer);
 
+  let envelope: Envelope<T> | null = null;
+  try {
+    const rawString = decoder.decode(decryptedBytes);
+    const parsed = JSON.parse(rawString);
+    if (parsed && typeof parsed === 'object' && typeof parsed.iat === 'number') {
+      envelope = parsed;
+    }
+  } catch {
+    // Not raw JSON, try decompressing below
+  }
+
+  if (!envelope) {
+    try {
+      const decompressed = await decompressBytes(decryptedBytes);
+      envelope = JSON.parse(decoder.decode(decompressed));
+    } catch {
+      throw new Error('Failed to parse or decompress session envelope');
+    }
+  }
+
+  if (!envelope) {
+    throw new Error('Failed to parse or decompress session envelope');
+  }
+
+  return checkEnvelope(envelope, toleranceMs);
+}
+
+function checkEnvelope<T>(envelope: Envelope<T>, toleranceMs: number): T {
+  const now = Date.now();
   if (typeof envelope.exp === 'number' && now - toleranceMs > envelope.exp) {
     throw new Error('Session has expired');
   }
-
   return envelope.data;
 }

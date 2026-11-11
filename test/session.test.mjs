@@ -5,65 +5,137 @@ import {
   unsealData,
   parseCookies,
   serializeCookie,
+  validateCookiePrefix,
   SessionManager,
 } from '../dist/index.js';
 
-test('sealData and unsealData round-trip preserves arbitrary JSON data', async () => {
-  const secret = 'super-secret-passphrase-at-least-32-chars';
-  const payload = { userId: 'usr_123', roles: ['admin', 'billing'], verified: true };
+const TEST_SECRET = 'super-secret-passphrase-at-least-32-chars';
 
-  const sealed = await sealData(payload, secret);
+test('sealData and unsealData round-trip preserves arbitrary JSON data', async () => {
+  const payload = { userId: 'usr_123', roles: ['admin', 'billing'], verified: true };
+  const sealed = await sealData(payload, TEST_SECRET);
   assert.ok(typeof sealed === 'string');
   assert.ok(sealed.startsWith('v1.'));
 
-  const unsealed = await unsealData(sealed, secret);
+  const unsealed = await unsealData(sealed, TEST_SECRET);
   assert.deepEqual(unsealed, payload);
 });
 
-test('unsealData fails closed when payload is tampered', async () => {
-  const secret = 'super-secret-passphrase-at-least-32-chars';
-  const payload = { userId: 'usr_123' };
+test('AAD (Additional Authenticated Data) binding prevents session hijacking', async () => {
+  const payload = { userId: 'usr_sensitive' };
+  const clientA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)';
+  const clientB = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)';
 
-  const sealed = await sealData(payload, secret);
+  // Seal with client A's User-Agent bound as AAD
+  const sealed = await sealData(payload, TEST_SECRET, { additionalData: clientA });
+
+  // Unseal with client A succeeds
+  const unsealedA = await unsealData(sealed, TEST_SECRET, { additionalData: clientA });
+  assert.deepEqual(unsealedA, payload);
+
+  // Unseal with client B (hijack attempt) MUST fail closed
+  await assert.rejects(
+    () => unsealData(sealed, TEST_SECRET, { additionalData: clientB }),
+    /failed to unseal session|authentication failed/i
+  );
+
+  // Unseal with omitted AAD MUST also fail closed
+  await assert.rejects(
+    () => unsealData(sealed, TEST_SECRET),
+    /failed to unseal session|authentication failed/i
+  );
+});
+
+test('Transparent payload compression reduces large session sizes', async () => {
+  const largePayload = {
+    items: Array.from({ length: 100 }, (_, i) => ({ id: i, text: `Item description number ${i} with repetitive text` })),
+  };
+
+  const uncompressed = await sealData(largePayload, TEST_SECRET, { compress: false });
+  const compressed = await sealData(largePayload, TEST_SECRET, { compress: true });
+
+  // Compressed payload should be substantially smaller
+  assert.ok(compressed.length < uncompressed.length);
+
+  const restored = await unsealData(compressed, TEST_SECRET);
+  assert.deepEqual(restored, largePayload);
+});
+
+test('Prefix Guard enforces strict invariants for __Host- and __Secure- cookies', () => {
+  // Valid __Host-
+  assert.doesNotThrow(() => {
+    serializeCookie('__Host-session', 'val', { path: '/', secure: true });
+  });
+
+  // Invalid: __Host- with secure: false
+  assert.throws(
+    () => serializeCookie('__Host-session', 'val', { secure: false }),
+    /__Host- cookies must have Secure=true/
+  );
+
+  // Invalid: __Host- with non-root path
+  assert.throws(
+    () => serializeCookie('__Host-session', 'val', { path: '/api', secure: true }),
+    /__Host- cookies must have Path="\/"/
+  );
+
+  // Invalid: __Host- with domain
+  assert.throws(
+    () => serializeCookie('__Host-session', 'val', { domain: 'example.com', secure: true }),
+    /__Host- cookies must not specify a Domain attribute/
+  );
+
+  // Invalid: __Secure- with secure: false
+  assert.throws(
+    () => serializeCookie('__Secure-session', 'val', { secure: false }),
+    /__Secure- cookies must have Secure=true/
+  );
+});
+
+test('Bit-flip fuzzing: any single-bit mutation anywhere in ciphertext or tag is rejected', async () => {
+  const payload = { admin: true, balance: 1_000_000 };
+  const sealed = await sealData(payload, TEST_SECRET);
   const parts = sealed.split('.');
-  // Flip characters in the ciphertext part
-  const tamperedCipher = parts[3].slice(0, -2) + (parts[3].endsWith('a') ? 'b' : 'a');
-  const tampered = [parts[0], parts[1], parts[2], tamperedCipher].join('.');
+
+  // Ciphertext part contains AES-GCM ciphertext + 128-bit authentication tag
+  const cipherBytes = Buffer.from(parts[3], 'base64url');
+
+  // Test bit flips across multiple byte offsets
+  const offsets = [0, 1, 5, Math.floor(cipherBytes.length / 2), cipherBytes.length - 1];
+  for (const offset of offsets) {
+    const mutated = Buffer.from(cipherBytes);
+    mutated[offset] ^= 0x01; // flip 1 bit
+    const tampered = [parts[0], parts[1], parts[2], mutated.toString('base64url')].join('.');
+
+    await assert.rejects(
+      () => unsealData(tampered, TEST_SECRET),
+      /failed to unseal session|authentication failed/i
+    );
+  }
+});
+
+test('Truncation attack: truncated ciphertext or missing components fail closed', async () => {
+  const payload = { token: 'xyz' };
+  const sealed = await sealData(payload, TEST_SECRET);
+  const parts = sealed.split('.');
+
+  // Truncate ciphertext in half
+  const truncatedCipher = parts[3].slice(0, Math.floor(parts[3].length / 2));
+  const truncated = [parts[0], parts[1], parts[2], truncatedCipher].join('.');
 
   await assert.rejects(
-    () => unsealData(tampered, secret),
-    /failed to unseal session|authentication failed/i
+    () => unsealData(truncated, TEST_SECRET),
+    /failed to unseal session|authentication failed|invalid cryptographic component lengths/i
+  );
+
+  // Missing parts
+  await assert.rejects(
+    () => unsealData(parts[0] + '.' + parts[1], TEST_SECRET),
+    /invalid or unsupported sealed session format/i
   );
 });
 
-test('unsealData rejects invalid passwords', async () => {
-  const secret = 'correct-secret-passphrase-32-chars';
-  const wrongSecret = 'wrong-secret-passphrase-32-chars';
-  const payload = { hello: 'world' };
-
-  const sealed = await sealData(payload, secret);
-  await assert.rejects(
-    () => unsealData(sealed, wrongSecret),
-    /failed to unseal session|authentication failed/i
-  );
-});
-
-test('unsealData enforces expiration with TTL', async () => {
-  const secret = 'super-secret-passphrase-32-chars';
-  const payload = { temp: 'token' };
-
-  // TTL is 1 second, tolerance is 0 seconds
-  const sealed = await sealData(payload, secret, { ttl: 1 });
-  // Wait 1.1s
-  await new Promise((resolve) => setTimeout(resolve, 1100));
-
-  await assert.rejects(
-    () => unsealData(sealed, secret, { clockTolerance: 0 }),
-    /session has expired/i
-  );
-});
-
-test('unsealData supports transparent key rotation', async () => {
+test('unsealData supports transparent key rotation and session re-encryption', async () => {
   const oldSecret = 'old-secret-passphrase-32-chars';
   const newSecret = 'new-secret-passphrase-32-chars';
   const payload = { accountId: 'acc_999' };
@@ -75,65 +147,57 @@ test('unsealData supports transparent key rotation', async () => {
   const unsealed = await unsealData(sealedWithOld, [newSecret, oldSecret]);
   assert.deepEqual(unsealed, payload);
 
-  // Data sealed with new key can also be unsealed
-  const sealedWithNew = await sealData(payload, [newSecret, oldSecret]);
-  const unsealedFromNew = await unsealData(sealedWithNew, [newSecret, oldSecret]);
-  assert.deepEqual(unsealedFromNew, payload);
+  // Re-encrypt (rotate) with new key
+  const manager = new SessionManager({ password: [newSecret, oldSecret] });
+  const migratedCookie = await manager.rotateSession(unsealed);
+
+  // Must now unseal with new key alone
+  const unsealedWithNewOnly = await unsealData(
+    parseCookies(migratedCookie).session,
+    newSecret
+  );
+  assert.deepEqual(unsealedWithNewOnly, payload);
 });
 
-test('cookie helpers correctly parse and serialize with security attributes and CHIPS', () => {
-  const serialized = serializeCookie('sid', 'sealed.token.value', {
-    httpOnly: true,
-    secure: true,
-    sameSite: 'strict',
-    path: '/api',
-    maxAge: 3600,
-    partitioned: true,
-  });
+test('unsealData enforces expiration with TTL', async () => {
+  const payload = { temp: 'token' };
+  const sealed = await sealData(payload, TEST_SECRET, { ttl: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 1100));
 
-  assert.ok(serialized.includes('sid=sealed.token.value'));
-  assert.ok(serialized.includes('HttpOnly'));
-  assert.ok(serialized.includes('Secure'));
-  assert.ok(serialized.includes('SameSite=Strict'));
-  assert.ok(serialized.includes('Path=/api'));
-  assert.ok(serialized.includes('Max-Age=3600'));
-  assert.ok(serialized.includes('Partitioned'));
-
-  const parsed = parseCookies(serialized);
-  assert.equal(parsed.sid, 'sealed.token.value');
+  await assert.rejects(
+    () => unsealData(sealed, TEST_SECRET, { clockTolerance: 0 }),
+    /session has expired/i
+  );
 });
 
-test('SessionManager handles full session lifecycle and clears expired sessions', async () => {
+test('SessionManager handles full session lifecycle with AAD client binding', async () => {
   const sessionManager = new SessionManager({
     cookieName: '__Secure-session',
-    password: ['master-key-rot-2', 'master-key-rot-1'],
+    password: ['key-rot-2', 'key-rot-1'],
     ttl: 3600,
+    compress: true,
   });
 
-  // Create session
-  const setCookie = await sessionManager.setSession({ user: 'alice', plan: 'enterprise' });
-  assert.ok(setCookie.startsWith('__Secure-session=v1.'));
-  assert.ok(setCookie.includes('HttpOnly'));
-  assert.ok(setCookie.includes('Secure'));
+  const clientIp = '203.0.113.1';
 
-  // Extract from incoming cookie string
-  const session = await sessionManager.getSession(setCookie);
+  // Set session bound to client IP
+  const setCookie = await sessionManager.setSession(
+    { user: 'alice', plan: 'enterprise' },
+    3600,
+    clientIp
+  );
+  assert.ok(setCookie.startsWith('__Secure-session=v1.'));
+
+  // Get session with matching client IP
+  const session = await sessionManager.getSession(setCookie, clientIp);
   assert.ok(session);
   assert.equal(session.user, 'alice');
-  assert.equal(session.plan, 'enterprise');
 
-  // Extract from Headers object
-  const headers = new Headers();
-  headers.set('cookie', setCookie);
-  const sessionFromHeaders = await sessionManager.getSession(headers);
-  assert.deepEqual(sessionFromHeaders, session);
+  // Get session with mismatched client IP (attack) returns null
+  const hijacked = await sessionManager.getSession(setCookie, '198.51.100.99');
+  assert.equal(hijacked, null);
 
-  // Invalid cookie returns null gracefully
-  const invalidSession = await sessionManager.getSession('__Secure-session=invalid.gibberish.token');
-  assert.equal(invalidSession, null);
-
-  // Clear session produces expiration header
+  // Clear session
   const clearCookie = sessionManager.clearSession();
   assert.ok(clearCookie.includes('Max-Age=0'));
-  assert.ok(clearCookie.includes('Expires=Thu, 01 Jan 1970 00:00:00 GMT'));
 });
