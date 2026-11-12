@@ -206,3 +206,168 @@ test('SessionManager handles full session lifecycle with AAD client binding', as
   const clearCookie = sessionManager.clearSession();
   assert.ok(clearCookie.includes('Max-Age=0'));
 });
+
+test('Cookie parser and serializer comprehensive edge cases', () => {
+  // Empty or invalid headers
+  assert.deepEqual(parseCookies(null), {});
+  assert.deepEqual(parseCookies(undefined), {});
+  assert.deepEqual(parseCookies(''), {});
+
+  // Complex cookie string: no value, quoted value, malformed URI, empty segments
+  const parsed = parseCookies('flag; session="my-secret-val"; bad=%E0%A4; ; normal=123');
+  assert.equal(parsed.flag, '');
+  assert.equal(parsed['session'], 'my-secret-val');
+  assert.equal(parsed['bad'], '%E0%A4');
+  assert.equal(parsed.normal, '123');
+
+  // Serialization errors
+  assert.throws(() => serializeCookie('', 'val'), /cookie name must be a non-empty string/i);
+  assert.throws(() => serializeCookie(null, 'val'), /cookie name must be a non-empty string/i);
+
+  // Prefix Guard violations
+  assert.throws(() => serializeCookie('__Host-id', '1', { secure: false }), /__Host- cookies must have Secure=true/i);
+  assert.throws(() => serializeCookie('__Host-id', '1', { path: '/sub' }), /__Host- cookies must have Path="\/"/i);
+  assert.throws(() => serializeCookie('__Host-id', '1', { domain: 'example.com' }), /__Host- cookies must not specify a Domain/i);
+  assert.throws(() => serializeCookie('__Secure-id', '1', { secure: false }), /__Secure- cookies must have Secure=true/i);
+
+  // Full serialization with all options
+  const expDate = new Date('2030-01-01T00:00:00Z');
+  const serialized = serializeCookie('test_cookie', 'val 1', {
+    maxAge: 7200,
+    expires: expDate,
+    domain: 'takao.me',
+    path: '/api',
+    secure: false,
+    httpOnly: false,
+    sameSite: 'none',
+    partitioned: true,
+  });
+  assert.ok(serialized.includes('test_cookie=val%201'));
+  assert.ok(serialized.includes('Max-Age=7200'));
+  assert.ok(serialized.includes('Expires=Tue, 01 Jan 2030'));
+  assert.ok(serialized.includes('Domain=takao.me'));
+  assert.ok(serialized.includes('Path=/api'));
+  assert.ok(!serialized.includes('Secure'));
+  assert.ok(!serialized.includes('HttpOnly'));
+  assert.ok(serialized.includes('SameSite=None'));
+  assert.ok(serialized.includes('Partitioned'));
+
+  // sameSite strict and lax
+  assert.ok(serializeCookie('c', '1', { sameSite: 'strict' }).includes('SameSite=Strict'));
+  assert.ok(serializeCookie('c', '1', { sameSite: true }).includes('SameSite=Strict'));
+  assert.ok(serializeCookie('c', '1', { sameSite: 'lax' }).includes('SameSite=Lax'));
+});
+
+test('sealData and unsealData failure and validation edge cases', async () => {
+  // Empty secret validation
+  await assert.rejects(() => sealData({ a: 1 }, []), /at least one non-empty secret is required/i);
+  await assert.rejects(() => sealData({ a: 1 }, ''), /at least one non-empty secret is required/i);
+
+  // Unseal validation errors
+  await assert.rejects(() => unsealData('', TEST_SECRET), /non-empty string/i);
+  await assert.rejects(() => unsealData('v1.a.b.c', []), /at least one secret is required/i);
+  await assert.rejects(() => unsealData('invalid.format', TEST_SECRET), /invalid or unsupported sealed session format/i);
+  await assert.rejects(() => unsealData('v2.salt.iv.cipher', TEST_SECRET), /invalid or unsupported sealed session format/i);
+  await assert.rejects(() => unsealData('v1.not_b64!.bad.bad', TEST_SECRET), /malformed base64url encoding/i);
+  await assert.rejects(() => unsealData('v1.AQ.AQ.AQ', TEST_SECRET), /invalid cryptographic component lengths/i);
+
+  // Decryption failure when no key matches
+  const validSealed = await sealData({ foo: 'bar' }, 'correct-secret');
+  await assert.rejects(
+    () => unsealData(validSealed, 'completely-wrong-secret'),
+    /failed to unseal session/i
+  );
+
+  // Payload that decrypts successfully but is not valid JSON
+  const crypto = globalThis.crypto;
+  const rawKey = new TextEncoder().encode('valid-secret-key-padding-to-32b!');
+  const k = await crypto.subtle.importKey('raw', rawKey, { name: 'PBKDF2' }, false, ['deriveKey']);
+  const salt = new Uint8Array(16);
+  const derivedKey = await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 1000, hash: 'SHA-256' },
+    k,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt']
+  );
+  const iv = new Uint8Array(12);
+  const encryptedGarbage = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    derivedKey,
+    new TextEncoder().encode('this is completely invalid json and not compressed!')
+  );
+  function toB64(bytes) {
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+  const garbageSealed = `v1.${toB64(salt)}.${toB64(iv)}.${toB64(new Uint8Array(encryptedGarbage))}`;
+  await assert.rejects(
+    () => unsealData(garbageSealed, 'valid-secret-key-padding-to-32b!', { iterations: 1000 }),
+    /failed to parse or decompress session envelope/i
+  );
+});
+
+test('SessionManager constructor errors and custom options', () => {
+  // Missing or invalid password
+  assert.throws(() => new SessionManager(null), /requires a non-empty password/i);
+  assert.throws(() => new SessionManager({}), /requires a non-empty password/i);
+  assert.throws(() => new SessionManager({ password: [] }), /at least one valid password/i);
+  assert.throws(() => new SessionManager({ password: [''] }), /at least one valid password/i);
+
+  // Custom iterations and custom cookie options
+  const customSm = new SessionManager({
+    password: 'secret-passphrase',
+    iterations: 50_000,
+    cookie: { path: '/app', secure: true },
+  });
+  assert.equal(customSm.iterations, 50_000);
+  assert.equal(customSm.cookieOptions.path, '/app');
+});
+
+test('SessionManager headers extraction and rotation edge cases', async () => {
+  const sm = new SessionManager({
+    password: TEST_SECRET,
+  });
+
+  // Default cookieName and TTL
+  assert.equal(sm.cookieName, 'session');
+  assert.equal(sm.ttl, 86400);
+
+  const sealed = await sm.setSession({ role: 'admin' });
+  const cookieHeader = `session=${sealed.split(';')[0].split('=')[1]}`;
+
+  // Extract from plain string
+  const s1 = await sm.getSession(cookieHeader);
+  assert.equal(s1?.role, 'admin');
+
+  // Extract from Headers object
+  const headers = new Headers();
+  headers.set('cookie', cookieHeader);
+  const s2 = await sm.getSession(headers);
+  assert.equal(s2?.role, 'admin');
+
+  // Extract from object with headers.get()
+  const s3 = await sm.getSession({ headers });
+  assert.equal(s3?.role, 'admin');
+
+  // Extract from object with plain headers dict (lowercase cookie)
+  const s4 = await sm.getSession({ headers: { cookie: cookieHeader } });
+  assert.equal(s4?.role, 'admin');
+
+  // Extract from object with plain headers dict (Capital Cookie)
+  const s5 = await sm.getSession({ headers: { Cookie: cookieHeader } });
+  assert.equal(s5?.role, 'admin');
+
+  // Extract from null, undefined, empty object
+  assert.equal(await sm.getSession(null), null);
+  assert.equal(await sm.getSession(undefined), null);
+  assert.equal(await sm.getSession({}), null);
+
+  // Missing session cookie in request
+  assert.equal(await sm.getSession('other_cookie=xyz'), null);
+
+  // rotateSession helper
+  const rotated = await sm.rotateSession({ role: 'admin', updated: true });
+  assert.ok(rotated.startsWith('session=v1.'));
+});
