@@ -31,17 +31,8 @@ export function fromBase64Url(base64url: string): Uint8Array {
 }
 
 export function getWebCrypto(): Crypto {
-  if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.subtle) {
+  if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto?.subtle) {
     return globalThis.crypto;
-  }
-  try {
-    const g = globalThis as any;
-    const nodeCrypto = g.crypto || (typeof g.process !== 'undefined' && g.process?.versions?.node ? (eval('require')('node:crypto') as any).webcrypto : undefined);
-    if (nodeCrypto?.subtle) {
-      return nodeCrypto as Crypto;
-    }
-  } catch {
-    // ignore
   }
   throw new Error('WebCrypto SubtleCrypto is not available in this environment');
 }
@@ -285,11 +276,7 @@ export async function unsealData<T = any>(
     }
   }
 
-  if (!envelope) {
-    throw new Error('Failed to parse or decompress session envelope');
-  }
-
-  return checkEnvelope(envelope, toleranceMs);
+  return checkEnvelope(envelope!, toleranceMs);
 }
 
 function checkEnvelope<T>(envelope: Envelope<T>, toleranceMs: number): T {

@@ -12,6 +12,7 @@ import {
   parseCookies,
   serializeCookie,
   SessionManager,
+  getWebCrypto,
 } from '../dist/index.js';
 
 const TEST_SECRET = 'super-secret-passphrase-at-least-32-chars';
@@ -370,4 +371,39 @@ test('SessionManager headers extraction and rotation edge cases', async () => {
   // rotateSession helper
   const rotated = await sm.rotateSession({ role: 'admin', updated: true });
   assert.ok(rotated.startsWith('session=v1.'));
+});
+
+test('unsealData rejects invalid sealed session envelope versions and formats', async () => {
+  await assert.rejects(
+    () => unsealData('v2.salt.iv.cipher', TEST_SECRET),
+    /Invalid or unsupported sealed session format/i
+  );
+  await assert.rejects(
+    () => unsealData('not-enough-parts.two.three', TEST_SECRET),
+    /Invalid or unsupported sealed session format/i
+  );
+  await assert.rejects(
+    () => unsealData('v1.only.three', TEST_SECRET),
+    /Invalid or unsupported sealed session format/i
+  );
+});
+
+test('getWebCrypto returns subtle crypto or throws when unavailable', () => {
+  // 1. Normal resolution returns subtle
+  const cryptoInstance = getWebCrypto();
+  assert.ok(cryptoInstance.subtle);
+
+  // 2. Throws when crypto is unavailable
+  const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+  try {
+    Object.defineProperty(globalThis, 'crypto', { configurable: true, value: undefined });
+    assert.throws(
+      () => getWebCrypto(),
+      /WebCrypto SubtleCrypto is not available in this environment/i
+    );
+  } finally {
+    if (originalCrypto) {
+      Object.defineProperty(globalThis, 'crypto', originalCrypto);
+    }
+  }
 });
