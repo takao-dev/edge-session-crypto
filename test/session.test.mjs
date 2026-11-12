@@ -1,11 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { webcrypto } from 'node:crypto';
+
+if (!globalThis.crypto || !globalThis.crypto.subtle) {
+  globalThis.crypto = webcrypto;
+}
+
 import {
   sealData,
   unsealData,
   parseCookies,
   serializeCookie,
-  validateCookiePrefix,
   SessionManager,
 } from '../dist/index.js';
 

@@ -6,7 +6,7 @@
 export * from './crypto.js';
 export * from './cookie.js';
 
-import { sealData, unsealData, SealOptions, UnsealOptions } from './crypto.js';
+import { sealData, unsealData } from './crypto.js';
 import { parseCookies, serializeCookie, CookieSerializeOptions } from './cookie.js';
 
 export interface SessionConfig {
