@@ -3,8 +3,12 @@
 Stateless, encrypted cookie session manager for Edge, Cloudflare Workers, Node.js, and modern runtimes. Powered by native WebCrypto (AES-256-GCM + PBKDF2-SHA256) with zero runtime dependencies.
 
 [![npm version](https://img.shields.io/npm/v/edge-session-crypto.svg)](https://www.npmjs.com/package/edge-session-crypto)
+[![CI](https://github.com/takao-dev/edge-session-crypto/actions/workflows/ci.yml/badge.svg)](https://github.com/takao-dev/edge-session-crypto/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/takao-dev/edge-session-crypto/branch/main/graph/badge.svg)](https://codecov.io/gh/takao-dev/edge-session-crypto)
+[![CodeQL](https://github.com/takao-dev/edge-session-crypto/actions/workflows/codeql.yml/badge.svg)](https://github.com/takao-dev/edge-session-crypto/actions/workflows/codeql.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)]()
+[![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg)]()
 
 ---
 

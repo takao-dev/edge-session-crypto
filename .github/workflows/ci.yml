@@ -39,6 +39,13 @@ jobs:
       - name: Compile TypeScript
         run: npm run build
 
+      - name: Codecov Bundle Analysis
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == '22.x'
+        env:
+          BUNDLE_ANALYZER_UPLOAD_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          npx --yes @codecov/bundle-analyzer ./dist --bundle-name=${{ github.event.repository.name }} || true
+
       - name: Run test suite (with coverage)
         if: matrix.os == 'ubuntu-latest' && matrix.node-version == '22.x'
         run: npm run test:coverage
