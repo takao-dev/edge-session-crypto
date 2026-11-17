@@ -14,6 +14,7 @@ import {
   SessionManager,
   getWebCrypto,
 } from '../dist/index.js';
+import { compressBytes, decompressBytes } from '../dist/crypto.js';
 
 const TEST_SECRET = 'super-secret-passphrase-at-least-32-chars';
 
@@ -438,4 +439,9 @@ test('getWebCrypto returns subtle crypto or throws when unavailable', () => {
       Object.defineProperty(globalThis, 'crypto', originalCrypto);
     }
   }
+});
+
+test('decompressBytes rejects payloads exceeding MAX_SESSION_PAYLOAD_BYTES', async () => {
+  const bigCompressed = await compressBytes(new Uint8Array(1_048_577));
+  await assert.rejects(() => decompressBytes(bigCompressed), /Session payload exceeds the configured limit/);
 });
