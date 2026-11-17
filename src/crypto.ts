@@ -6,6 +6,7 @@
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+const MAX_SESSION_PAYLOAD_BYTES = 1_048_576;
 
 export function toBase64Url(bytes: Uint8Array): string {
   let binary = '';
@@ -70,12 +71,7 @@ export async function deriveKey(secret: string, salt: Uint8Array, iterations = 1
  */
 export async function compressBytes(data: Uint8Array): Promise<Uint8Array> {
   if (typeof CompressionStream === 'undefined') return data;
-  const cs = new CompressionStream('deflate');
-  const writer = cs.writable.getWriter();
-  await writer.write(data as unknown as BufferSource);
-  await writer.close();
-  const buffer = await new Response(cs.readable).arrayBuffer();
-  return new Uint8Array(buffer);
+  return transformBytes(data, new CompressionStream('deflate'), MAX_SESSION_PAYLOAD_BYTES + 65_536);
 }
 
 /**
@@ -83,12 +79,36 @@ export async function compressBytes(data: Uint8Array): Promise<Uint8Array> {
  */
 export async function decompressBytes(data: Uint8Array): Promise<Uint8Array> {
   if (typeof DecompressionStream === 'undefined') return data;
-  const ds = new DecompressionStream('deflate');
-  const writer = ds.writable.getWriter();
-  await writer.write(data as unknown as BufferSource);
-  await writer.close();
-  const buffer = await new Response(ds.readable).arrayBuffer();
-  return new Uint8Array(buffer);
+  return transformBytes(data, new DecompressionStream('deflate'), MAX_SESSION_PAYLOAD_BYTES);
+}
+
+async function transformBytes(data: Uint8Array, stream: CompressionStream | DecompressionStream, maxOutput: number): Promise<Uint8Array> {
+  const reader = stream.readable.getReader();
+  const writer = stream.writable.getWriter();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  const draining = (async () => {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.byteLength;
+      if (length > maxOutput) {
+        await reader.cancel('Session payload exceeds the configured limit');
+        throw new RangeError('Session payload exceeds the configured limit');
+      }
+      chunks.push(value);
+    }
+  })();
+  try {
+    await Promise.all([writer.write(data as unknown as BufferSource).then(() => writer.close()), draining]);
+  } catch (error) {
+    await writer.abort(error).catch(() => undefined);
+    throw error;
+  }
+  const output = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.length; }
+  return output;
 }
 
 export interface SealOptions {
@@ -103,7 +123,7 @@ export interface SealOptions {
 }
 
 export interface UnsealOptions {
-  /** Allowed clock drift in seconds when checking expiration. Defaults to 60s. */
+  /** Allowed clock drift in seconds when checking expiration. Defaults to 0s. */
   clockTolerance?: number;
   /** PBKDF2 derivation iterations. Defaults to 100,000. */
   iterations?: number;
@@ -130,6 +150,8 @@ export async function sealData<T = any>(
   if (secrets.length === 0 || !secrets[0]) {
     throw new Error('At least one non-empty secret is required to seal session data');
   }
+  if (options.ttl !== undefined && (!Number.isFinite(options.ttl) || options.ttl <= 0)) throw new Error('ttl must be a positive finite number');
+  validateIterations(options.iterations ?? 100_000);
   const activeSecret = secrets[0];
   const crypto = getWebCrypto();
 
@@ -138,7 +160,7 @@ export async function sealData<T = any>(
     data,
     iat: now,
   };
-  if (typeof options.ttl === 'number' && options.ttl > 0) {
+  if (typeof options.ttl === 'number') {
     envelope.exp = now + options.ttl * 1000;
   }
   if (options.compress) {
@@ -151,6 +173,7 @@ export async function sealData<T = any>(
 
   const key = await deriveKey(activeSecret, salt, iterations);
   let plaintextBytes: Uint8Array = encoder.encode(JSON.stringify(envelope));
+  if (plaintextBytes.byteLength > MAX_SESSION_PAYLOAD_BYTES) throw new RangeError('Session payload exceeds the 1 MiB limit');
   if (options.compress) {
     plaintextBytes = await compressBytes(plaintextBytes);
   }
@@ -196,6 +219,9 @@ export async function unsealData<T = any>(
   if (secrets.length === 0) {
     throw new Error('At least one secret is required to unseal session data');
   }
+  validateIterations(options.iterations ?? 100_000);
+  if (options.clockTolerance !== undefined && (!Number.isFinite(options.clockTolerance) || options.clockTolerance < 0)) throw new Error('clockTolerance must be non-negative and finite');
+  if (sealed.length > 1_500_000) throw new RangeError('Sealed session exceeds the maximum encoded size');
 
   const parts = sealed.split('.');
   if (parts.length !== 4 || parts[0] !== 'v1') {
@@ -215,13 +241,13 @@ export async function unsealData<T = any>(
     throw new Error('Malformed base64url encoding in sealed session');
   }
 
-  if (salt.length !== 16 || iv.length !== 12 || ciphertext.length < 16) {
+  if (salt.length !== 16 || iv.length !== 12 || ciphertext.length < 16 || ciphertext.length > MAX_SESSION_PAYLOAD_BYTES + 65_536 + 16) {
     throw new Error('Invalid cryptographic component lengths');
   }
 
   const crypto = getWebCrypto();
   const iterations = options.iterations ?? 100_000;
-  const toleranceMs = (options.clockTolerance ?? 60) * 1000;
+  const toleranceMs = (options.clockTolerance ?? 0) * 1000;
 
   const gcmParams: AesGcmParams = {
     name: 'AES-GCM',
@@ -260,14 +286,14 @@ export async function unsealData<T = any>(
   try {
     const rawString = decoder.decode(decryptedBytes);
     const parsed = JSON.parse(rawString);
-    if (parsed && typeof parsed === 'object' && typeof parsed.iat === 'number') {
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && typeof parsed.iat === 'number') {
       envelope = parsed;
     }
   } catch {
     // Not raw JSON, try decompressing below
   }
 
-  if (!envelope) {
+  if (!envelope && decryptedBytes.length <= MAX_SESSION_PAYLOAD_BYTES) {
     try {
       const decompressed = await decompressBytes(decryptedBytes);
       envelope = JSON.parse(decoder.decode(decompressed));
@@ -280,9 +306,15 @@ export async function unsealData<T = any>(
 }
 
 function checkEnvelope<T>(envelope: Envelope<T>, toleranceMs: number): T {
+  if (!envelope || typeof envelope !== 'object' || !Number.isFinite(envelope.iat)) throw new Error('Invalid session envelope');
+  if (envelope.exp !== undefined && !Number.isFinite(envelope.exp)) throw new Error('Invalid session expiry');
   const now = Date.now();
-  if (typeof envelope.exp === 'number' && now - toleranceMs > envelope.exp) {
+  if (typeof envelope.exp === 'number' && now - toleranceMs >= envelope.exp) {
     throw new Error('Session has expired');
   }
   return envelope.data;
+}
+
+function validateIterations(iterations: number): void {
+  if (!Number.isInteger(iterations) || iterations < 1 || iterations > 1_000_000) throw new Error('PBKDF2 iterations must be an integer from 1 to 1000000');
 }

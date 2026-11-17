@@ -51,6 +51,7 @@ export function parseCookies(header: string | null | undefined): Record<string, 
   if (!header || typeof header !== 'string') {
     return {};
   }
+  if (header.length > 16_384) throw new RangeError('Cookie header exceeds 16 KiB');
 
   const cookies: Record<string, string> = {};
   const pairs = header.split(';');
@@ -61,7 +62,7 @@ export function parseCookies(header: string | null | undefined): Record<string, 
 
     const eqIdx = pair.indexOf('=');
     if (eqIdx === -1) {
-      cookies[pair] = '';
+      if (!Object.hasOwn(cookies, pair)) Object.defineProperty(cookies, pair, { value: '', enumerable: true, configurable: true, writable: true });
       continue;
     }
 
@@ -74,9 +75,9 @@ export function parseCookies(header: string | null | undefined): Record<string, 
     }
 
     try {
-      cookies[key] = decodeURIComponent(val);
+      if (!Object.hasOwn(cookies, key)) Object.defineProperty(cookies, key, { value: decodeURIComponent(val), enumerable: true, configurable: true, writable: true });
     } catch {
-      cookies[key] = val;
+      if (!Object.hasOwn(cookies, key)) Object.defineProperty(cookies, key, { value: val, enumerable: true, configurable: true, writable: true });
     }
   }
 
@@ -94,6 +95,12 @@ export function serializeCookie(
   if (!name || typeof name !== 'string') {
     throw new Error('Cookie name must be a non-empty string');
   }
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) throw new Error('Cookie name contains invalid characters');
+  if (/[\r\n;]/.test(value)) throw new Error('Cookie value contains invalid characters');
+  if (options.path !== undefined && /[\u0000-\u001f\u007f;]/.test(options.path)) throw new Error('Cookie path contains invalid characters');
+  if (options.domain !== undefined && (options.domain.startsWith('.') || options.domain.endsWith('.') || !options.domain.split('.').every((label) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label)))) throw new Error('Cookie domain is invalid');
+  if (options.maxAge !== undefined && !Number.isFinite(options.maxAge)) throw new Error('Cookie maxAge must be finite');
+  if ((options.sameSite === 'none' || options.partitioned) && options.secure === false) throw new Error('SameSite=None and Partitioned cookies require Secure=true');
 
   // Enforce Prefix Guard
   validateCookiePrefix(name, options);

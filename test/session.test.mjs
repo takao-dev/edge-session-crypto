@@ -67,6 +67,16 @@ test('Transparent payload compression reduces large session sizes', async () => 
   assert.deepEqual(restored, largePayload);
 });
 
+test('compression streams drain concurrently for large incompressible session data', async () => {
+  const random = Buffer.alloc(300_000);
+  for (let offset = 0; offset < random.length; offset += 65_536) {
+    webcrypto.getRandomValues(random.subarray(offset, Math.min(random.length, offset + 65_536)));
+  }
+  const payload = { data: random.toString('base64') };
+  const sealed = await sealData(payload, TEST_SECRET, { compress: true });
+  assert.deepEqual(await unsealData(sealed, TEST_SECRET), payload);
+});
+
 test('Prefix Guard enforces strict invariants for __Host- and __Secure- cookies', () => {
   // Valid __Host-
   assert.doesNotThrow(() => {
@@ -96,6 +106,17 @@ test('Prefix Guard enforces strict invariants for __Host- and __Secure- cookies'
     () => serializeCookie('__Secure-session', 'val', { secure: false }),
     /__Secure- cookies must have Secure=true/
   );
+});
+
+test('cookie serialization and parsing reject injection and duplicate-name ambiguity', () => {
+  assert.throws(() => serializeCookie('session', 'x', { path: '/; Secure=false' }), /cookie path contains invalid characters/i);
+  assert.throws(() => serializeCookie('session', 'x', { domain: 'example.com\r\nSet-Cookie: admin=1' }), /cookie domain is invalid/i);
+  assert.throws(() => serializeCookie('session', 'x', { sameSite: 'none', secure: false }), /require Secure=true/i);
+  assert.throws(() => serializeCookie('bad name', 'x'), /cookie name contains invalid characters/i);
+  const parsed = parseCookies('__proto__=safe; session=first; session=second');
+  assert.equal(Object.getPrototypeOf(parsed), Object.prototype);
+  assert.equal(Object.hasOwn(parsed, '__proto__'), true);
+  assert.equal(parsed.session, 'first');
 });
 
 test('Bit-flip fuzzing: any single-bit mutation anywhere in ciphertext or tag is rejected', async () => {
@@ -171,9 +192,20 @@ test('unsealData enforces expiration with TTL', async () => {
   await new Promise((resolve) => setTimeout(resolve, 1100));
 
   await assert.rejects(
-    () => unsealData(sealed, TEST_SECRET, { clockTolerance: 0 }),
+    () => unsealData(sealed, TEST_SECRET),
     /session has expired/i
   );
+});
+
+test('session expiry is enforced at the exact expiry boundary', async () => {
+  const originalNow = Date.now;
+  const base = originalNow();
+  try {
+    Date.now = () => base;
+    const sealed = await sealData({ role: 'user' }, TEST_SECRET, { ttl: 1 });
+    Date.now = () => base + 1000;
+    await assert.rejects(() => unsealData(sealed, TEST_SECRET), /session has expired/i);
+  } finally { Date.now = originalNow; }
 });
 
 test('SessionManager handles full session lifecycle with AAD client binding', async () => {
@@ -238,7 +270,7 @@ test('Cookie parser and serializer comprehensive edge cases', () => {
     expires: expDate,
     domain: 'takao.me',
     path: '/api',
-    secure: false,
+    secure: true,
     httpOnly: false,
     sameSite: 'none',
     partitioned: true,
@@ -248,7 +280,7 @@ test('Cookie parser and serializer comprehensive edge cases', () => {
   assert.ok(serialized.includes('Expires=Tue, 01 Jan 2030'));
   assert.ok(serialized.includes('Domain=takao.me'));
   assert.ok(serialized.includes('Path=/api'));
-  assert.ok(!serialized.includes('Secure'));
+  assert.ok(serialized.includes('Secure'));
   assert.ok(!serialized.includes('HttpOnly'));
   assert.ok(serialized.includes('SameSite=None'));
   assert.ok(serialized.includes('Partitioned'));

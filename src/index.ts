@@ -44,6 +44,7 @@ export class SessionManager<T = Record<string, any>> {
     }
 
     this.ttl = config.ttl ?? 86400; // 24 hours
+    if (!Number.isFinite(this.ttl) || this.ttl <= 0) throw new Error('Session TTL must be a positive finite number');
     this.iterations = config.iterations ?? 100_000;
     this.compress = Boolean(config.compress);
     this.cookieOptions = {
